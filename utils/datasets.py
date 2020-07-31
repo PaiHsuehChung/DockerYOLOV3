@@ -206,6 +206,7 @@ class LoadStreams:  # multiple IP or RTSP cameras
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             fps = cap.get(cv2.CAP_PROP_FPS) % 100
             _, self.imgs[i] = cap.read()  # guarantee first frame
+            print(self.imgs[i].shape)
             thread = Thread(target=self.update, args=([i, cap]), daemon=True)
             print(' success (%gx%g at %.2f FPS).' % (w, h, fps))
             thread.start()
@@ -224,16 +225,18 @@ class LoadStreams:  # multiple IP or RTSP cameras
             n += 1
             # _, self.imgs[index] = cap.read()
             cap.grab()
-            if n == 4:  # read every 4th frame
-                _, self.imgs[index] = cap.retrieve()
-                n = 0
-            time.sleep(0.01)  # wait time
+            #if n == 2:  # read every 2th frame
+            _, self.imgs[index] = cap.retrieve()
+                #n = 0
+            #time.sleep(0.01)  # wait time
 
     def __iter__(self):
         self.count = -1
         return self
 
     def __next__(self):
+        roi_detect_area = np.array([[[0, 600], [350, 250], [800, 250], [800, 600]]], np.int32) 
+        #roi_detect_area = np.array([[[100, 600], [350, 250], [425, 250], [520, 600]]], np.int32) # Single left road
         self.count += 1
         img0 = self.imgs.copy()
         if cv2.waitKey(1) == ord('q'):  # q to quit
@@ -241,13 +244,16 @@ class LoadStreams:  # multiple IP or RTSP cameras
             raise StopIteration
 
         # Letterbox
-        img = [letterbox(x, new_shape=self.img_size, auto=self.rect)[0] for x in img0]
-
+        for x in img0:
+            mask = np.full((x.shape[0], x.shape[1]), 0, dtype=np.uint8)
+            mask_area = cv2.fillPoly(mask, [roi_detect_area], 255)
+            submask_area = cv2.bitwise_and(x, x, mask = mask_area)
+            img = [letterbox(submask_area, new_shape=self.img_size, auto=self.rect)[0]]
         # Stack
         img = np.stack(img, 0)
 
         # Convert
-        img = img[:, :, :, ::-1].transpose(0, 3, 1, 2)  # BGR to RGB, to bsx3x416x416
+        img = img[:, :, :, ::-1].transpose(0, 3, 1, 2)  # BGR to RGB, to bsx3x416x416           
         img = np.ascontiguousarray(img)
 
         return self.sources, img, img0, None

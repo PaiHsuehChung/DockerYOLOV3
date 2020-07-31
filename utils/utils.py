@@ -8,6 +8,9 @@ import time
 from copy import copy
 from pathlib import Path
 from sys import platform
+from scipy.spatial import distance
+from collections import OrderedDict
+import queue
 
 import cv2
 import matplotlib
@@ -28,6 +31,22 @@ matplotlib.rc('font', **{'size': 11})
 # Prevent OpenCV from multithreading (to use PyTorch DataLoader)
 cv2.setNumThreads(0)
 
+
+# Setup deque
+streaming_queue = queue.Queue()
+
+# estimate car speed
+raw_data = {'id':[], 'in_start':[], 'in_stop':[],'info':[]}
+
+result = {}
+speed_list = []
+speed_lidar = {'startID':[], 'start':[], 'stopID':[],'speed':[]} 
+start_line = [(290, 410), (520, 410)]
+end_line = [(350, 300), (460, 300)] # Blue line
+speed_start_detect_area = np.array([[start_line[0], start_line[1], [start_line[1][0], 460], [start_line[0][0], 460]]], np.int32) 
+spped_end_detect_area = np.array([[end_line[0], end_line[1], [end_line[1][0], 320], [end_line[0][0], 320]]], np.int32) 
+# start_line = [(300, 450), (720, 440)] # Red Line
+# end_line = [(350, 330), (600, 320)] # Blue line
 
 def init_seeds(seed=0):
     random.seed(seed)
@@ -820,6 +839,198 @@ def output_to_target(output, width, height):
 
     return np.array(targets)
 
+def queue_container(image):
+    image = cv2.resize(image, (520, 380), interpolation=cv2.INTER_CUBIC)
+    streaming_queue.put(image)
+
+def get_count():
+    print("Total frames are inferenced : {}".format(streaming_queue.qsize()))
+    return streaming_queue.get()
+
+
+def get_frame():
+    print("Total frames are inferenced : {}".format(streaming_queue.qsize()))
+    while not streaming_queue.empty():
+        return cv2.imencode('.jpg', streaming_queue.get())[1].tobytes()
+
+
+class Tracker:
+    def __init__(self, maxLost = 30):           # maxLost: maximum object lost counted when the object is being tracked
+        self.nextObjectID = 0                   # ID of next object
+        self.objects = OrderedDict()            # stores ID:Locations
+        self.lost = OrderedDict()               # stores ID:Lost_count
+        
+        self.maxLost = maxLost                  # maximum number of frames object was not detected.
+        
+    def addObject(self, new_object_location):
+        self.objects[self.nextObjectID] = new_object_location    # store new object location
+        self.lost[self.nextObjectID] = 0                         # initialize frame_counts for when new object is undetected
+        
+        self.nextObjectID += 1
+    
+    def removeObject(self, objectID):                          # remove tracker data after object is lost
+        del self.objects[objectID]
+        del self.lost[objectID]
+    
+    @staticmethod
+    def getLocation(bounding_box):
+        xlt, ylt, xrb, yrb = bounding_box
+        return (int((xlt + xrb) / 2.0), int((ylt + yrb) / 2.0))
+    
+    def update(self,  detections):
+        
+        if len(detections) == 0:   # if no object detected in the frame
+            lost_ids = list(self.lost.keys())
+            for objectID in lost_ids:
+                self.lost[objectID] +=1
+                if self.lost[objectID] > self.maxLost: self.removeObject(objectID)
+            
+            return self.objects
+        
+        new_object_locations = np.zeros((len(detections), 2), dtype="int")     # current object locations
+        
+        for (i, detection) in enumerate(detections): new_object_locations[i] = self.getLocation(detection)
+            
+        if len(self.objects)==0:
+            for i in range(0, len(detections)): self.addObject(new_object_locations[i])
+        else:
+            objectIDs = list(self.objects.keys())
+            previous_object_locations = np.array(list(self.objects.values()))
+            
+            D = distance.cdist(previous_object_locations, new_object_locations) # pairwise distance between previous and current
+            
+            row_idx = D.min(axis=1).argsort()   # (minimum distance of previous from current).sort_as_per_index
+            
+            cols_idx = D.argmin(axis=1)[row_idx]   # index of minimum distance of previous from current
+            
+            assignedRows, assignedCols = set(), set()
+            
+            for (row, col) in zip(row_idx, cols_idx):
+                
+                if row in assignedRows or col in assignedCols:
+                    continue
+                
+                objectID = objectIDs[row]
+                self.objects[objectID] = new_object_locations[col]
+                self.lost[objectID] = 0
+                
+                assignedRows.add(row)
+                assignedCols.add(col)
+                
+            unassignedRows = set(range(0, D.shape[0])).difference(assignedRows)
+            unassignedCols = set(range(0, D.shape[1])).difference(assignedCols)
+            
+            
+            if D.shape[0]>=D.shape[1]:
+                for row in unassignedRows:
+                    objectID = objectIDs[row]
+                    self.lost[objectID] += 1
+                    
+                    if self.lost[objectID] > self.maxLost:
+                        self.removeObject(objectID)
+                        
+            else:
+                for col in unassignedCols:
+                    self.addObject(new_object_locations[col])
+            
+        return self.objects
+
+
+def plot_tacker_id(objects, img):
+    tl = round(0.002 * (img.shape[0] + img.shape[1]) / 2) + 1  # line/font thickness
+    tf = max(tl - 1, 1)
+    for (objectID, centroid) in objects.items():
+        text = "ID {}".format(objectID)
+        cv2.putText(img, text, (centroid[0] - 10, centroid[1] - 10), 0, tl / 3, [225, 255, 255], thickness=tf, lineType=cv2.LINE_AA)
+        cv2.circle(img, (centroid[0], centroid[1]), 4, (0, 255, 0), -1) 
+
+#FIXME:Estimate speed
+def estimateSpeed(location1, location2):
+	d_pixels = math.sqrt(math.pow(location2[0] - location1[0], 2) + math.pow(location2[1] - location1[1], 2))
+	# ppm = location2[2] / carWidht
+	ppm = 160
+	d_meters = d_pixels / ppm
+	#print("d_pixels=" + str(d_pixels), "d_meters=" + str(d_meters))
+	fps = 25
+	speed = d_meters * fps * 3.6
+	return speed
+
+def plot_speed_detection(objects, img, ts):
+    for objectID, objectBBOX in objects.items():
+        x, y = objectBBOX
+
+        ct1 = cv2.pointPolygonTest(speed_start_detect_area, (x,y), False)
+        ct2 = cv2.pointPolygonTest(spped_end_detect_area, (x,y), False)
+        
+        if ct1==1 and (objectID not in speed_lidar.get('startID')):
+            print(f"{objectID} in the start ploygon. Cor: x-{x}, y-{y}.")
+            speed_lidar.get('startID').append(objectID)
+            speed_lidar.get('start').append({'id':objectID, 'center':(x,y), 'ts':ts})
+#             cor = '{},{}'.format(x,y)
+#             mask_area = cv2.fillPoly(frame, [speed_start_detect_area], 255)
+#             cv2.putText(frame, cor, (x, y),cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 0, 0), 2)
+
+        if ct2==1 and objectID in speed_lidar.get('startID') and objectID not in speed_lidar.get('stopID'):
+            print(f"{objectID} in the stop ploygon. Cor: x-{x}, y-{y}.")
+            speed_lidar.get('stopID').append(objectID)
+            idx = speed_lidar.get('startID').index(objectID)
+            obj = speed_lidar.get('start')[idx]
+            start_time = obj.get('ts')
+            start_position = obj.get('center')
+
+            timeInSeconds = abs(ts-start_time)
+            timeInHours = timeInSeconds / (60*60)
+            distanceInMeters = math.sqrt(math.pow(x - start_position[0], 2) + math.pow(y - start_position[1], 2))
+            distanceInMeters *= 0.15
+            distanceInKM = distanceInMeters / 1000
+
+            speedKMPH = np.average(distanceInKM/timeInHours)
+            MILES_PER_ONE_KILOMETER = 0.621371
+            speedMPH = MILES_PER_ONE_KILOMETER * speedKMPH
+
+            speed_lidar.get('speed').append({"id":objectID, "speedKMPH":speedKMPH, "speedMPH":speedMPH})
+
+        if len(speed_lidar.get('speed')) > 0:
+            for item in speed_lidar.get('speed'):
+                if item.get('id') == objectID:
+                    speed = item.get('speedKMPH')
+                    cv2.putText(img, str(int(speed)) + " km/hr", (x, y),cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 0, 255), 2)
+                    #print(speed_lidar.get('speed'))
+
+        
+
+
+
+
+        # standy by the region of interest
+        # if (x >= start_line[0][0] and x <= start_line[1][0]) and (y >= start_line[0][1]):
+        #     if objectID not in raw_data.get('id'):
+        #         print(f"{ objectID } into region of interest.")
+        #         raw_data.get('id').append(objectID)
+
+        # # cross the start line    
+        # if len(raw_data.get('id')) > 0 and (x >= start_line[0][0] and x <= start_line[1][0]) and (y <= start_line[0][1]):
+        #     if (objectID in raw_data.get('id')) and (objectID not in raw_data.get('in_start')):
+        #         raw_data.get('in_start').append(objectID)
+        #         raw_data.get('info').append({'id':objectID, 'center':(x,y)})
+        #         print(f'{objectID} crossing the start road')
+                    
+        # # cross the end line                
+        # if len(raw_data.get('in_start')) > 0 and  (x >= end_line[0][0] and x <= end_line[1][0]) and (y <= end_line[0][1]):
+        #     if (objectID in raw_data.get('in_start')) and (objectID not in raw_data.get('in_stop')):
+        #         raw_data.get('in_stop').append(objectID)
+        #         index = raw_data.get('in_start').index(objectID)
+        #         speed = estimateSpeed(raw_data.get('info')[index].get('center'), (x,y))
+        #         speed_list.append({'id':objectID, 'speed':speed})
+        #         print(f'{objectID} crossing the end road')
+                
+    
+        # if len(raw_data.get('in_stop')) > 0 and (objectID in raw_data.get('in_stop')):
+        #     idx = raw_data.get('in_stop').index(objectID)
+        #     speed = speed_list[idx].get('speed')
+        #     cv2.putText(img, str(int(speed)) + " km/hr", (x, y),cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 0, 255), 2)
+
+
 
 # Plotting functions ---------------------------------------------------------------------------------------------------
 def plot_one_box(x, img, color=None, label=None, line_thickness=None):
@@ -828,12 +1039,13 @@ def plot_one_box(x, img, color=None, label=None, line_thickness=None):
     color = color or [random.randint(0, 255) for _ in range(3)]
     c1, c2 = (int(x[0]), int(x[1])), (int(x[2]), int(x[3]))
     cv2.rectangle(img, c1, c2, color, thickness=tl, lineType=cv2.LINE_AA)
-    if label:
-        tf = max(tl - 1, 1)  # font thickness
-        t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
-        c2 = c1[0] + t_size[0], c1[1] - t_size[1] - 3
-        cv2.rectangle(img, c1, c2, color, -1, cv2.LINE_AA)  # filled
-        cv2.putText(img, label, (c1[0], c1[1] - 2), 0, tl / 3, [225, 255, 255], thickness=tf, lineType=cv2.LINE_AA)
+    # if label:
+    #     tf = max(tl - 1, 1)  # font thickness
+    #     t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
+    #     c2 = c1[0] + t_size[0], c1[1] - t_size[1] - 3
+    #     cv2.rectangle(img, c1, c2, color, -1, cv2.LINE_AA)  # filled
+    #     cv2.putText(img, label, (c1[0], c1[1] - 2), 0, tl / 3, [225, 255, 255], thickness=tf, lineType=cv2.LINE_AA)
+    return (c1[0], c1[1], c2[0], c2[1])
 
 
 def plot_wh_methods():  # from utils.utils import *; plot_wh_methods()
